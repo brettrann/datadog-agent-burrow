@@ -5,6 +5,10 @@ from urlparse import urljoin
 import requests
 import json
 
+# debugging
+# import pprint
+# pp = pprint.PrettyPrinter(indent=4)
+
 # project
 from checks import AgentCheck
 
@@ -12,7 +16,7 @@ SERVICE_CHECK_NAME = 'burrow.can_connect'
 
 DEFAULT_BURROW_URI = 'http://localhost:8000'
 
-CLUSTER_ENDPOINT = '/v2/kafka'
+CLUSTER_ENDPOINT = '/v3/kafka'
 
 CHECK_TIMEOUT = 10
 
@@ -60,8 +64,8 @@ class BurrowCheck(AgentCheck):
 
                 for partition in status.get("partitions", []):
                     partition_tags = consumer_tags + ["topic:%s" % partition["topic"], "partition:%s" % partition["partition"]]
-                    self._submit_partition_lags(partition, partition_tags)
-                    self._submit_lag_status("kafka.consumer.partition_lag_status", partition["status"], tags=partition_tags)
+                    if self._submit_partition_lags(partition, partition_tags):
+                        self._submit_lag_status("kafka.consumer.partition_lag_status", partition["status"], tags=partition_tags)
 
     def _submit_lag_status(self, metric_namespace, status, tags):
         burrow_status = {
@@ -80,13 +84,21 @@ class BurrowCheck(AgentCheck):
 
         burrow_status[status] = 1
 
+        # this submits a lot of metrics.
+        # for each topic, for each partition, all 7 statuses are submitted!
         for metric_name, value in burrow_status.iteritems():
             self.gauge("%s.%s" % (metric_namespace, metric_name.lower()), value, tags=tags)
 
     def _submit_partition_lags(self, partition, tags):
-        lag = partition.get("end").get("lag")
-        timestamp = partition.get("end").get("timestamp") / 1000
-        self.gauge("kafka.consumer.partition_lag", lag, tags=tags, timestamp=timestamp)
+        try:
+            lag = partition.get("end").get("lag")
+            timestamp = partition.get("end").get("timestamp") / 1000
+            self.gauge("kafka.consumer.partition_lag", lag, tags=tags, timestamp=timestamp)
+            return True
+        except:
+            # if you have empty partitions ther will be no end/timestamp. just don't report it
+            self.log.debug("Missing partition lag info: '%s:%s'" % (partition.get("topic"), partition.get("partition")))
+            return False
 
     def _check_burrow(self, burrow_address, extra_tags):
         """
@@ -113,11 +125,10 @@ class BurrowCheck(AgentCheck):
         """
         for cluster in clusters:
             cluster_path = "%s/%s" % (CLUSTER_ENDPOINT, cluster)
-            offsets_topic = self._rest_request_to_json(burrow_address, cluster_path)["cluster"]["offsets_topic"]
             topics_path = "%s/topic" % cluster_path
             topics_list = self._rest_request_to_json(burrow_address, topics_path).get("topics", [])
             for topic in topics_list:
-                if topic == offsets_topic:
+                if topic == "__consumer_offsets":
                     continue
                 topic_path = "%s/%s" % (topics_path, topic)
                 response = self._rest_request_to_json(burrow_address, topic_path)
@@ -132,16 +143,26 @@ class BurrowCheck(AgentCheck):
             consumers_path = "%s/%s/consumer" % (CLUSTER_ENDPOINT, cluster)
             consumers_list = self._rest_request_to_json(burrow_address, consumers_path).get("consumers", [])
             for consumer in consumers_list:
-                topics_path = "%s/%s/topic" % (consumers_path, consumer)
-                topics_list = self._rest_request_to_json(burrow_address, topics_path).get("topics", [])
-                for topic in topics_list:
-                    topic_path = "%s/%s" % (topics_path, topic)
-                    response = self._rest_request_to_json(burrow_address, topic_path)
-                    if not response:
-                        continue
+                consumer_path = "%s/%s" % (consumers_path, consumer)
+                try:
+                    topics_dict = self._rest_request_to_json(burrow_ddress, consumer_path).get("topics", {})
+                except:
+                    continue
+
+                for topic, partitions in topics_dict.items():
+                    offsets = []
+                    for partition in partitions:
+                        if len(partition.get("offsets")) == 0:
+                            continue
+                        try:
+                            offsets.append(partition.get("offsets")[-1].get("offset"))
+                        except:
+                            ## sometimes there's a lot of null offsets. Assume 0?
+                            offsets.append(0)
+
                     tags = ["topic:%s" % topic, "cluster:%s" % cluster,
                             "consumer:%s" % consumer] + extra_tags
-                    self._submit_offsets_from_json(offsets_type="consumer", json=response, tags=tags)
+                    self._submit_offsets_from_json(offsets_type="consumer", json={"offsets":offsets}, tags=tags)
 
     def _submit_offsets_from_json(self, offsets_type, json, tags):
         """
